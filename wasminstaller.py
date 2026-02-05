@@ -1,0 +1,579 @@
+#!/usr/bin/env python3
+"""
+WASM App Installer
+Creates a standalone desktop application from WASM distribution files.
+"""
+
+import sys
+import json
+import shutil
+import argparse
+import subprocess
+from pathlib import Path
+from dataclasses import dataclass, asdict
+import os
+
+
+@dataclass
+class InstallerConfig:
+    app_name: str
+    icon_path: str
+    display_name: str
+    version: str = "1.0.0"
+    description: str = ""
+    author: str = ""
+    install_dir: Path = None
+
+    def __post_init__(self):
+        if self.install_dir is None:
+            self.install_dir = Path.home() / "UserApps" / self.app_name
+
+
+class WASMAppInstaller:
+    def __init__(self, config: InstallerConfig):
+        self.config = config
+        self.source_dir = Path.cwd()
+        self.install_dir = config.install_dir
+        self.wasm_app_dir = self.install_dir / "wasm-app"
+        self.launcher_path = self.install_dir / "launcher.py"
+
+    def install(self):
+        """Run the complete installation process"""
+        print(f"Installing {self.config.display_name}...")
+        print(f"Source: {self.source_dir}")
+        print(f"Target: {self.install_dir}")
+
+        # Step 1: Create directory structure
+        self._create_directories()
+
+        # Step 2: Copy WASM files
+        self._copy_wasm_files()
+
+        # Step 3: Copy icon
+        self._copy_icon()
+
+        # Step 4: Create launcher script
+        self._create_launcher()
+
+        # Step 5: Create config
+        self._create_config()
+
+        # Step 6: Create desktop entry (Linux)
+        if sys.platform.startswith('linux'):
+            self._create_desktop_entry()
+
+        # Step 7: Build standalone binary
+        self._build_binary()
+
+        print(f"\n✓ Installation complete!")
+        print(f"  App directory: {self.install_dir}")
+        print(f"  Executable: {self.install_dir / 'dist' / self.config.app_name}")
+
+        if sys.platform.startswith('linux'):
+            desktop_file = Path.home() / ".local/share/applications" / f"{self.config.app_name}.desktop"
+            print(f"  Desktop entry: {desktop_file}")
+
+    def _create_directories(self):
+        """Create necessary directory structure"""
+        print("\n[1/7] Creating directories...")
+
+        dirs = [
+            self.install_dir,
+            self.wasm_app_dir,
+            self.wasm_app_dir / "wasmtainer" / "config",
+            self.wasm_app_dir / "wasmtainer" / "browser-data",
+        ]
+
+        for directory in dirs:
+            directory.mkdir(parents=True, exist_ok=True)
+            print(f"  Created: {directory}")
+
+    def _copy_wasm_files(self):
+        """Copy all WASM distribution files"""
+        print("\n[2/7] Copying WASM files...")
+
+        # Get all items in source directory
+        items = list(self.source_dir.iterdir())
+
+        print(f"  Found {len(items)} items to copy")
+
+        for item in items:
+            # Skip hidden files/directories
+            if item.name.startswith('.'):
+                print(f"  Skipped (hidden): {item.name}")
+                continue
+
+            # Skip installer script
+            if item.name in ['install.py', 'installer.py', 'wasminstaller.py']:
+                print(f"  Skipped (installer): {item.name}")
+                continue
+
+            target = self.wasm_app_dir / item.name
+
+            try:
+                if item.is_dir():
+                    # Remove existing directory if present
+                    if target.exists():
+                        shutil.rmtree(target)
+                    # Copy directory recursively
+                    shutil.copytree(item, target, symlinks=True)
+                    print(f"  ✓ Copied directory: {item.name}")
+                else:
+                    # Copy file with metadata
+                    shutil.copy2(item, target)
+                    print(f"  ✓ Copied file: {item.name}")
+            except Exception as e:
+                print(f"  ✗ Failed to copy {item.name}: {e}")
+
+        print(f"  Done copying to {self.wasm_app_dir}")
+
+    def _copy_icon(self):
+        """Copy application icon"""
+        print("\n[3/7] Copying icon...")
+
+        icon_source = Path(self.config.icon_path)
+        if not icon_source.exists():
+            print(f"  Warning: Icon not found at {icon_source}")
+            return
+
+        # Copy to install directory
+        icon_target = self.install_dir / icon_source.name
+        shutil.copy2(icon_source, icon_target)
+        print(f"  Copied icon: {icon_target}")
+
+        # Also copy to wasm-app for web display
+        web_icon_target = self.wasm_app_dir / icon_source.name
+        shutil.copy2(icon_source, web_icon_target)
+
+    def _create_launcher(self):
+        """Create the launcher.py script"""
+        print("\n[4/7] Creating launcher script...")
+
+        launcher_code = '''#!/usr/bin/env python3
+"""
+{display_name} Launcher
+Generated by WASM App Installer
+"""
+
+import sys
+import json
+import http.server
+import socketserver
+import threading
+import socket
+import os
+from pathlib import Path
+from dataclasses import dataclass, asdict
+from typing import Optional
+from PyQt6.QtWidgets import QApplication, QMainWindow
+from PyQt6.QtWebEngineWidgets import QWebEngineView
+from PyQt6.QtWebEngineCore import QWebEngineSettings, QWebEngineProfile, QWebEnginePage
+from PyQt6.QtCore import QUrl
+from PyQt6.QtGui import QIcon
+
+
+@dataclass
+class ServerConfig:
+    port: int = 8080
+    ip: str = "127.0.0.1"
+    window_title: str = "{display_name}"
+    app_icon: str = "{icon_name}"
+    devtools_port: int = 9223
+
+    def to_dict(self):
+        return asdict(self)
+
+    @classmethod
+    def from_dict(cls, data: dict):
+        return cls(**{{k: v for k, v in data.items() if k in cls.__annotations__}})
+
+
+class ConfigManager:
+    def __init__(self, app_dir: Path):
+        self.app_dir = app_dir
+        self.config_dir = app_dir / "wasmtainer" / "config"
+        self.config_file = self.config_dir / "config.json"
+        self.config_dir.mkdir(parents=True, exist_ok=True)
+
+    def load_or_create(self) -> ServerConfig:
+        if self.config_file.exists():
+            try:
+                with open(self.config_file, 'r') as f:
+                    data = json.load(f)
+                return ServerConfig.from_dict(data)
+            except Exception as e:
+                print(f"Error loading config: {{e}}. Creating default config.")
+                return self._create_default()
+        else:
+            return self._create_default()
+
+    def _create_default(self) -> ServerConfig:
+        config = ServerConfig()
+        self.save(config)
+        return config
+
+    def save(self, config: ServerConfig):
+        try:
+            with open(self.config_file, 'w') as f:
+                json.dump(config.to_dict(), f, indent=2)
+        except Exception as e:
+            print(f"Error saving config: {{e}}")
+
+
+class PortManager:
+    @staticmethod
+    def is_port_available(port: int, ip: str = "127.0.0.1") -> bool:
+        try:
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                s.bind((ip, port))
+                return True
+        except OSError:
+            return False
+
+    @staticmethod
+    def find_available_port(start_port: int, ip: str = "127.0.0.1", max_tries: int = 100) -> int:
+        port = start_port
+        for _ in range(max_tries):
+            if PortManager.is_port_available(port, ip):
+                return port
+            port += 1
+
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.bind((ip, 0))
+            return s.getsockname()[1]
+
+
+class CORSHTTPRequestHandler(http.server.SimpleHTTPRequestHandler):
+    def end_headers(self):
+        self.send_header('Access-Control-Allow-Origin', '*')
+        self.send_header('Access-Control-Allow-Methods', 'GET, POST, OPTIONS')
+        self.send_header('Access-Control-Allow-Headers', '*')
+        self.send_header('Cross-Origin-Opener-Policy', 'same-origin')
+        self.send_header('Cross-Origin-Embedder-Policy', 'require-corp')
+        super().end_headers()
+
+    def do_OPTIONS(self):
+        self.send_response(200)
+        self.end_headers()
+
+    def log_message(self, format, *args):
+        pass  # Suppress server logs
+
+
+class WebViewWindow(QMainWindow):
+    def __init__(self, app_dir: Path, config: ServerConfig):
+        super().__init__()
+
+        self.config = config
+        self.app_dir = app_dir
+
+        self.setWindowTitle(self.config.window_title)
+        self.resize(1024, 768)
+
+        # Set window icon
+        icon_path = app_dir.parent / self.config.app_icon
+        if icon_path.exists():
+            self.setWindowIcon(QIcon(str(icon_path)))
+
+        self.profile = self._create_persistent_profile()
+        self.page = QWebEnginePage(self.profile, self)
+
+        self.browser = QWebEngineView()
+        self.browser.setPage(self.page)
+        self.setCentralWidget(self.browser)
+
+        self.server_port: Optional[int] = None
+        self.server_ready = threading.Event()
+        self.httpd: Optional[socketserver.TCPServer] = None
+
+        self.actual_port = self._determine_port()
+
+        self.server_thread = threading.Thread(target=self.start_server, daemon=True)
+        self.server_thread.start()
+
+        if self.server_ready.wait(timeout=5):
+            url = f"http://{{self.config.ip}}:{{self.actual_port}}/index.html"
+            self.browser.setUrl(QUrl(url))
+
+        settings = self.browser.settings()
+        settings.setAttribute(QWebEngineSettings.WebAttribute.LocalStorageEnabled, True)
+        settings.setAttribute(QWebEngineSettings.WebAttribute.JavascriptEnabled, True)
+        settings.setAttribute(QWebEngineSettings.WebAttribute.WebGLEnabled, True)
+        settings.setAttribute(QWebEngineSettings.WebAttribute.Accelerated2dCanvasEnabled, True)
+
+    def _create_persistent_profile(self) -> QWebEngineProfile:
+        storage_dir = self.app_dir / "wasmtainer" / "browser-data"
+        storage_dir.mkdir(parents=True, exist_ok=True)
+
+        profile = QWebEngineProfile("{app_name}_profile", None)
+        profile.setPersistentStoragePath(str(storage_dir / "storage"))
+        profile.setCachePath(str(storage_dir / "cache"))
+        profile.setPersistentCookiesPolicy(
+            QWebEngineProfile.PersistentCookiesPolicy.AllowPersistentCookies
+        )
+        profile.setHttpCacheType(QWebEngineProfile.HttpCacheType.DiskHttpCache)
+        profile.setHttpCacheMaximumSize(100 * 1024 * 1024)
+
+        return profile
+
+    def _determine_port(self) -> int:
+        if PortManager.is_port_available(self.config.port, self.config.ip):
+            return self.config.port
+        else:
+            new_port = PortManager.find_available_port(self.config.port + 1, self.config.ip)
+            self.config.port = new_port
+            config_manager = ConfigManager(self.app_dir)
+            config_manager.save(self.config)
+            return new_port
+
+    def start_server(self):
+        if not self.app_dir.exists():
+            self.server_ready.set()
+            return
+
+        try:
+            original_dir = os.getcwd()
+            os.chdir(self.app_dir)
+
+            self.httpd = socketserver.TCPServer(
+                (self.config.ip, self.actual_port),
+                CORSHTTPRequestHandler
+            )
+            self.server_port = self.actual_port
+            self.server_ready.set()
+            self.httpd.serve_forever()
+
+        except Exception as e:
+            self.server_ready.set()
+        finally:
+            try:
+                os.chdir(original_dir)
+            except:
+                pass
+
+    def closeEvent(self, event):
+        if self.httpd:
+            self.httpd.shutdown()
+        event.accept()
+
+
+def get_app_directory():
+    """
+    Get the application directory.
+    When running as PyInstaller bundle, find the install directory.
+    When running as script, use parent directory.
+    """
+    if getattr(sys, 'frozen', False):
+        # Running as PyInstaller bundle
+        # The executable is in dist/, so go up one level to get install dir
+        executable_path = Path(sys.executable).resolve()
+        install_dir = executable_path.parent.parent
+        app_dir = install_dir / "wasm-app"
+    else:
+        # Running as script
+        app_dir = Path(__file__).parent / "wasm-app"
+
+    return app_dir
+
+
+def setup_devtools(devtools_port: int):
+    if os.environ.get('WASM_DEVTOOLS', '').lower() == 'true':
+        os.environ['QTWEBENGINE_REMOTE_DEBUGGING'] = str(devtools_port)
+
+
+if __name__ == "__main__":
+    app_dir = get_app_directory()
+
+    if not app_dir.exists():
+        print(f"ERROR: WASM app directory not found: {{app_dir}}")
+        print(f"Expected location: {{app_dir}}")
+        print(f"Executable location: {{Path(sys.executable).resolve()}}")
+        sys.exit(1)
+
+    config_manager = ConfigManager(app_dir)
+    config = config_manager.load_or_create()
+
+    setup_devtools(config.devtools_port)
+
+    app = QApplication(sys.argv)
+    app.setApplicationName("{display_name}")
+    app.setApplicationVersion("{version}")
+
+    window = WebViewWindow(app_dir, config)
+    window.show()
+    sys.exit(app.exec())
+'''.format(
+            display_name=self.config.display_name,
+            app_name=self.config.app_name,
+            icon_name=Path(self.config.icon_path).name,
+            version=self.config.version
+        )
+
+        with open(self.launcher_path, 'w') as f:
+            f.write(launcher_code)
+
+        # Make executable
+        self.launcher_path.chmod(0o755)
+        print(f"  Created: {self.launcher_path}")
+
+    def _create_config(self):
+        """Create initial config.json"""
+        print("\n[5/7] Creating configuration...")
+
+        config_file = self.wasm_app_dir / "wasmtainer" / "config" / "config.json"
+
+        config_data = {
+            "port": 8080,
+            "ip": "127.0.0.1",
+            "window_title": self.config.display_name,
+            "app_icon": Path(self.config.icon_path).name,
+            "devtools_port": 9223
+        }
+
+        with open(config_file, 'w') as f:
+            json.dump(config_data, f, indent=2)
+
+        print(f"  Created: {config_file}")
+
+    def _create_desktop_entry(self):
+        """Create .desktop file for Linux"""
+        print("\n[6/7] Creating desktop entry...")
+
+        desktop_dir = Path.home() / ".local/share/applications"
+        desktop_dir.mkdir(parents=True, exist_ok=True)
+
+        desktop_file = desktop_dir / f"{self.config.app_name}.desktop"
+
+        icon_path = self.install_dir / Path(self.config.icon_path).name
+        exec_path = self.install_dir / "dist" / self.config.app_name
+
+        desktop_content = f"""[Desktop Entry]
+Version=1.0
+Type=Application
+Name={self.config.display_name}
+Comment={self.config.description or self.config.display_name}
+Exec={exec_path}
+Icon={icon_path}
+Terminal=false
+Categories=Application;Utility;
+StartupWMClass={self.config.app_name}
+"""
+
+        with open(desktop_file, 'w') as f:
+            f.write(desktop_content)
+
+        desktop_file.chmod(0o755)
+        print(f"  Created: {desktop_file}")
+
+    def _build_binary(self):
+        """Build standalone binary with PyInstaller"""
+        print("\n[7/7] Building standalone binary...")
+
+        try:
+            result = subprocess.run(
+                [sys.executable, '-m', 'PyInstaller', '--version'],
+                check=True,
+                capture_output=True,
+                text=True
+            )
+            print(f"  Using PyInstaller {result.stdout.strip()}")
+        except subprocess.CalledProcessError as e:
+            print("  ERROR: PyInstaller failed to run.")
+            print(e.stderr)
+            sys.exit(1)
+        except FileNotFoundError:
+            print("  ERROR: Python executable not found.")
+            sys.exit(1)
+
+
+        # PyInstaller command
+        icon_arg = []
+        icon_path = self.install_dir / Path(self.config.icon_path).name
+        if icon_path.exists() and icon_path.suffix in ['.ico', '.icns', '.png']:
+            icon_arg = ['--icon', str(icon_path)]
+
+        cmd = [
+            sys.executable,                     # Use Python executable
+            '-m', 'PyInstaller',                # Run PyInstaller as module
+            '--onefile',                        # Single executable
+            '--windowed',                       # No console window
+            '--name', self.config.app_name,
+            '--distpath', str(self.install_dir / 'dist'),
+            '--workpath', str(self.install_dir / 'build'),
+            '--specpath', str(self.install_dir),
+            *icon_arg,
+            str(self.launcher_path)
+        ]
+
+        print(f"  Running PyInstaller...")
+
+        result = subprocess.run(cmd, cwd=self.install_dir)
+
+        if result.returncode == 0:
+            print(f"  ✓ Binary created successfully")
+
+            # Make executable
+            binary_path = self.install_dir / 'dist' / self.config.app_name
+            if binary_path.exists():
+                binary_path.chmod(0o755)
+
+            # Clean up build artifacts
+            print(f"  Cleaning up build artifacts...")
+            build_dir = self.install_dir / 'build'
+            spec_file = self.install_dir / f'{self.config.app_name}.spec'
+
+            if build_dir.exists():
+                shutil.rmtree(build_dir)
+                print(f"    Removed: {build_dir}")
+
+            if spec_file.exists():
+                spec_file.unlink()
+                print(f"    Removed: {spec_file}")
+        else:
+            print(f"  ✗ Binary creation failed with code {result.returncode}")
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description='Install WASM application as standalone desktop app'
+    )
+    parser.add_argument('app_name', help='Application name (lowercase, no spaces)')
+    parser.add_argument('icon', help='Path to application icon file')
+    parser.add_argument('--display-name', help='Display name for the app', default=None)
+    parser.add_argument('--install-dir', help='Installation directory', default=None)
+    parser.add_argument('--description', help='App description', default='')
+    parser.add_argument('--author', help='Author name', default='')
+    parser.add_argument('--version', help='App version', default='1.0.0')
+
+    args = parser.parse_args()
+
+    # Validate app name
+    if not args.app_name.replace('-', '').replace('_', '').isalnum():
+        print("Error: app_name must contain only letters, numbers, hyphens, and underscores")
+        sys.exit(1)
+
+    # Check icon exists
+    if not Path(args.icon).exists():
+        print(f"Error: Icon file not found: {args.icon}")
+        sys.exit(1)
+
+    # Create config
+    install_dir = Path(args.install_dir) if args.install_dir else None
+
+    config = InstallerConfig(
+        app_name=args.app_name,
+        icon_path=args.icon,
+        display_name=args.display_name or args.app_name.replace('-', ' ').replace('_', ' ').title(),
+        version=args.version,
+        description=args.description,
+        author=args.author,
+        install_dir=install_dir
+    )
+
+    # Run installer
+    installer = WASMAppInstaller(config)
+    installer.install()
+
+
+if __name__ == '__main__':
+    main()
